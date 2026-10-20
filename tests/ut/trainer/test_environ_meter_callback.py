@@ -22,8 +22,11 @@ import torch
 
 import hyper_parallel.trainer.callbacks.environ_meter_callback as environ_meter_module
 from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
+from hyper_parallel.trainer.config.training import TrainingConfig
+from hyper_parallel.trainer.runtime.flops import estimate_train_flops
 from hyper_parallel.trainer.state import TrainerState
 from tests.common.mark_utils import arg_mark
+from tests.ut.trainer.test_flops import qwen3_30b_a3b_config
 
 
 class _NoItemScalar:
@@ -193,6 +196,109 @@ class TestEnvironMeterCallback(unittest.TestCase):
             4.0,
             f"expected CP replicas removed from samples, got={metrics['data/step_samples']}",
         )
+
+
+class TestEnvironMeterTflops(unittest.TestCase):
+    """Verify the optional per-device TFLOP/s metric."""
+
+    @staticmethod
+    def _build_trainer(enable_tflops: bool, dataset: object = None, seq_override: object = None) -> SimpleNamespace:
+        """Build a trainer exposing model and training configs used by the FLOPs estimate."""
+        return SimpleNamespace(
+            mesh=None,
+            lr_scheduler=None,
+            optimizer=SimpleNamespace(param_groups=[{"lr": 0.001}]),
+            model=SimpleNamespace(config=qwen3_30b_a3b_config(num_hidden_layers=4)),
+            config=SimpleNamespace(
+                training=TrainingConfig(
+                    global_batch_size=8,
+                    enable_tflops=enable_tflops,
+                    tflops_seq_length=seq_override,
+                ),
+                dataset=dataset,
+            ),
+        )
+
+    @staticmethod
+    def _run_step(trainer: SimpleNamespace) -> dict:
+        """Run one two-second step on eight mocked ranks and return its env metrics."""
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+        with patch.object(environ_meter_module, "get_device_type", return_value="cpu"), \
+                patch.object(environ_meter_module, "get_world_size_safe", return_value=8), \
+                patch.object(environ_meter_module, "all_reduce",
+                             side_effect=lambda value, op, group: float(value)), \
+                patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0)):
+            callback.on_step_begin(state)
+            callback.on_micro_step_begin(state, {"token_count": torch.tensor(128)})
+            callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+        return trainer.step_env_metrics
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_disabled_by_default(self) -> None:
+        """Keep existing metrics unchanged when enable_tflops is false.
+
+        Feature: Optional TFLOP/s metric.
+        Description: Run one step with the default training config.
+        Expectation: performance/tflops_per_device is absent.
+        """
+        dataset = SimpleNamespace(data_config={"seq_length": 128})
+        metrics = self._run_step(self._build_trainer(False, dataset))
+        self.assertNotIn("performance/tflops_per_device", metrics)
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_enabled_divides_step_flops_by_time_and_world_size(self) -> None:
+        """Publish step FLOPs / step time / world size / 1e12.
+
+        Feature: Optional TFLOP/s metric.
+        Description: Read seq_length from data_config and run a two-second step on eight ranks.
+        Expectation: The metric equals the hand-calculated cropped Qwen3-MoE FLOPs per device.
+        """
+        dataset = SimpleNamespace(data_config={"seq_length": 128})
+        metrics = self._run_step(self._build_trainer(True, dataset))
+        self.assertAlmostEqual(
+            metrics["performance/tflops_per_device"], 3_316_251_623_424 / 2.0 / 8 / 1e12
+        )
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_sequence_length_resolution_order(self) -> None:
+        """Prefer the override, then data_config, then data_transform.max_seq_len.
+
+        Feature: Optional TFLOP/s metric.
+        Description: Configure different sequence length sources.
+        Expectation: The estimate uses the highest-priority source and disables itself when none exists.
+        """
+        expected_256 = estimate_train_flops(qwen3_30b_a3b_config(num_hidden_layers=4), 8, 256) / 2.0 / 8 / 1e12
+        both = SimpleNamespace(
+            data_config={"seq_length": 128},
+            data_transform=SimpleNamespace(max_seq_len=512),
+        )
+        metrics = self._run_step(self._build_trainer(True, both, seq_override=256))
+        self.assertAlmostEqual(metrics["performance/tflops_per_device"], expected_256)
+
+        transform_only = SimpleNamespace(data_config=None, data_transform=SimpleNamespace(max_seq_len=256))
+        metrics = self._run_step(self._build_trainer(True, transform_only))
+        self.assertAlmostEqual(metrics["performance/tflops_per_device"], expected_256)
+
+        with self.assertLogs(environ_meter_module.logger, level="WARNING"):
+            metrics = self._run_step(self._build_trainer(True, SimpleNamespace(data_config=None)))
+        self.assertNotIn("performance/tflops_per_device", metrics)
+        self.assertIn("performance/step_time", metrics)
 
 
 if __name__ == "__main__":

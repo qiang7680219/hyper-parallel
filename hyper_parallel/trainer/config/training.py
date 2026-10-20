@@ -49,6 +49,17 @@ class TrainingConfig:
     eval_epochs: int = 0
     logging_steps: int = 1
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
+    # Log the configuration-estimated ``performance/tflops_per_device``.
+    enable_tflops: bool = False
+    # Sequence length used by the FLOPs estimate; None reads the dataset config.
+    tflops_seq_length: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        """Reject invalid FLOPs-estimate overrides at the configuration boundary."""
+        if self.tflops_seq_length is not None and self.tflops_seq_length <= 0:
+            raise ValueError(
+                f"training.tflops_seq_length must be positive, got {self.tflops_seq_length}"
+            )
 
 
 @dataclass
